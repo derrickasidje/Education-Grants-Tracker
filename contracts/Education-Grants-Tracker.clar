@@ -6,11 +6,18 @@
 (define-constant ERR-MILESTONE-NOT-DUE (err u105))
 (define-constant ERR-INSUFFICIENT-VOTES (err u106))
 (define-constant ERR-INVALID-TIMEFRAME (err u107))
+(define-constant ERR-RENEWAL-NOT-FOUND (err u108))
+(define-constant ERR-RENEWAL-ALREADY-EXISTS (err u109))
+(define-constant ERR-PERFORMANCE-TOO-LOW (err u110))
+(define-constant ERR-GRANT-NOT-COMPLETED (err u111))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var min-approval-threshold uint u3)
 (define-data-var next-grant-id uint u1)
 (define-data-var next-milestone-id uint u1)
+(define-data-var next-renewal-id uint u1)
+(define-data-var min-performance-score uint u70)
+(define-data-var auto-renewal-enabled bool true)
 
 (define-map Grants 
     uint 
@@ -73,6 +80,25 @@
     uint
 )
 
+(define-map GrantRenewals
+    uint
+    {
+        original-grant-id: uint,
+        recipient: principal,
+        requested-amount: uint,
+        justification: (string-ascii 500),
+        status: (string-ascii 20),
+        applied-at: uint,
+        auto-approved: bool,
+        performance-score-at-application: uint
+    }
+)
+
+(define-map RenewalRequests
+    {grant-id: uint}
+    uint
+)
+
 (define-read-only (get-grant (grant-id uint))
     (map-get? Grants grant-id)
 )
@@ -95,6 +121,32 @@
 
 (define-read-only (get-platform-metric (metric-name (string-ascii 20)))
     (default-to u0 (map-get? PlatformMetrics metric-name))
+)
+
+(define-read-only (get-renewal-request (renewal-id uint))
+    (map-get? GrantRenewals renewal-id)
+)
+
+(define-read-only (get-grant-renewal-status (grant-id uint))
+    (map-get? RenewalRequests {grant-id: grant-id})
+)
+
+(define-read-only (check-renewal-eligibility (grant-id uint))
+    (let
+        (
+            (grant (unwrap! (get-grant grant-id) ERR-GRANT-NOT-FOUND))
+            (performance-result (unwrap-panic (calculate-grant-performance-score grant-id)))
+        )
+        (ok {
+            eligible: (and 
+                (is-eq (get status grant) "ACTIVE")
+                (>= performance-result (var-get min-performance-score))
+                (is-eq (get remaining-amount grant) u0)
+            ),
+            performance-score: performance-result,
+            min-required-score: (var-get min-performance-score)
+        })
+    )
 )
 
 (define-read-only (calculate-grant-performance-score (grant-id uint))
@@ -248,6 +300,88 @@
     (begin
         (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
         (var-set min-approval-threshold new-threshold)
+        (ok true)
+    )
+)
+
+(define-public (apply-for-grant-renewal (grant-id uint) (requested-amount uint) (justification (string-ascii 500)))
+    (let
+        (
+            (renewal-id (var-get next-renewal-id))
+            (grant (unwrap! (get-grant grant-id) ERR-GRANT-NOT-FOUND))
+            (eligibility (unwrap-panic (check-renewal-eligibility grant-id)))
+            (existing-renewal (get-grant-renewal-status grant-id))
+            (performance-score (get performance-score eligibility))
+            (is-eligible (get eligible eligibility))
+            (should-auto-approve (and 
+                (var-get auto-renewal-enabled)
+                is-eligible
+                (>= performance-score (var-get min-performance-score))
+            ))
+        )
+        (asserts! (is-eq tx-sender (get recipient grant)) ERR-NOT-AUTHORIZED)
+        (asserts! is-eligible ERR-PERFORMANCE-TOO-LOW)
+        (asserts! (is-none existing-renewal) ERR-RENEWAL-ALREADY-EXISTS)
+        (asserts! (> requested-amount u0) ERR-INVALID-AMOUNT)
+        
+        (map-set GrantRenewals renewal-id {
+            original-grant-id: grant-id,
+            recipient: (get recipient grant),
+            requested-amount: requested-amount,
+            justification: justification,
+            status: (if should-auto-approve "APPROVED" "PENDING"),
+            applied-at: stacks-block-height,
+            auto-approved: should-auto-approve,
+            performance-score-at-application: performance-score
+        })
+        
+        (map-set RenewalRequests {grant-id: grant-id} renewal-id)
+        (var-set next-renewal-id (+ renewal-id u1))
+        
+        (if should-auto-approve
+            (begin
+                (try! (create-grant (get recipient grant) requested-amount))
+                (ok {renewal-id: renewal-id, auto-approved: true})
+            )
+            (ok {renewal-id: renewal-id, auto-approved: false})
+        )
+    )
+)
+
+(define-public (approve-renewal-request (renewal-id uint))
+    (let
+        (
+            (renewal (unwrap! (get-renewal-request renewal-id) ERR-RENEWAL-NOT-FOUND))
+        )
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status renewal) "PENDING") ERR-NOT-AUTHORIZED)
+        
+        (map-set GrantRenewals renewal-id (merge renewal {status: "APPROVED"}))
+        (try! (create-grant (get recipient renewal) (get requested-amount renewal)))
+        (ok true)
+    )
+)
+
+(define-public (reject-renewal-request (renewal-id uint))
+    (let
+        (
+            (renewal (unwrap! (get-renewal-request renewal-id) ERR-RENEWAL-NOT-FOUND))
+        )
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status renewal) "PENDING") ERR-NOT-AUTHORIZED)
+        
+        (map-set GrantRenewals renewal-id (merge renewal {status: "REJECTED"}))
+        (ok true)
+    )
+)
+
+(define-public (configure-renewal-settings (auto-renewal bool) (min-score uint))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (asserts! (<= min-score u100) ERR-INVALID-AMOUNT)
+        
+        (var-set auto-renewal-enabled auto-renewal)
+        (var-set min-performance-score min-score)
         (ok true)
     )
 )
