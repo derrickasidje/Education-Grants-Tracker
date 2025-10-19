@@ -10,6 +10,10 @@
 (define-constant ERR-RENEWAL-ALREADY-EXISTS (err u109))
 (define-constant ERR-PERFORMANCE-TOO-LOW (err u110))
 (define-constant ERR-GRANT-NOT-COMPLETED (err u111))
+(define-constant ERR-FEEDBACK-NOT-FOUND (err u112))
+(define-constant ERR-FEEDBACK-ALREADY-EXISTS (err u113))
+(define-constant ERR-INVALID-RATING (err u114))
+(define-constant ERR-FEEDBACK-TOO-LONG (err u115))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var min-approval-threshold uint u3)
@@ -18,6 +22,8 @@
 (define-data-var next-renewal-id uint u1)
 (define-data-var min-performance-score uint u70)
 (define-data-var auto-renewal-enabled bool true)
+(define-data-var next-feedback-id uint u1)
+(define-data-var feedback-enabled bool true)
 
 (define-map Grants 
     uint 
@@ -99,6 +105,36 @@
     uint
 )
 
+;; Grant Feedback System Maps
+(define-map GrantFeedback
+    uint
+    {
+        grant-id: uint,
+        feedback-type: (string-ascii 20),
+        provider: principal,
+        rating: uint,
+        comment: (string-ascii 500),
+        submitted-at: uint,
+        is-anonymous: bool
+    }
+)
+
+(define-map GrantFeedbackSummary
+    uint
+    {
+        total-feedback: uint,
+        avg-rating: uint,
+        recipient-feedback-count: uint,
+        committee-feedback-count: uint,
+        public-feedback-count: uint
+    }
+)
+
+(define-map FeedbackProviders
+    {grant-id: uint, provider: principal}
+    uint
+)
+
 (define-read-only (get-grant (grant-id uint))
     (map-get? Grants grant-id)
 )
@@ -129,6 +165,43 @@
 
 (define-read-only (get-grant-renewal-status (grant-id uint))
     (map-get? RenewalRequests {grant-id: grant-id})
+)
+
+;; Grant Feedback System Read-only Functions
+(define-read-only (get-grant-feedback (feedback-id uint))
+    (map-get? GrantFeedback feedback-id)
+)
+
+(define-read-only (get-grant-feedback-summary (grant-id uint))
+    (map-get? GrantFeedbackSummary grant-id)
+)
+
+(define-read-only (check-feedback-permission (grant-id uint) (provider principal))
+    (let
+        (
+            (grant (unwrap! (get-grant grant-id) ERR-GRANT-NOT-FOUND))
+            (existing-feedback (map-get? FeedbackProviders {grant-id: grant-id, provider: provider}))
+        )
+        (ok {
+            can-provide-feedback: (and 
+                (var-get feedback-enabled)
+                (is-none existing-feedback)
+                (or 
+                    (is-eq provider (get recipient grant))
+                    (is-eq provider (var-get contract-owner))
+                    true ;; Allow public feedback
+                )
+            ),
+            feedback-type: (if (is-eq provider (get recipient grant))
+                "RECIPIENT"
+                (if (is-eq provider (var-get contract-owner))
+                    "COMMITTEE"
+                    "PUBLIC"
+                )
+            ),
+            already-provided: (is-some existing-feedback)
+        })
+    )
 )
 
 (define-read-only (check-renewal-eligibility (grant-id uint))
@@ -386,6 +459,74 @@
     )
 )
 
+;; Grant Feedback System Public Functions
+(define-public (submit-grant-feedback (grant-id uint) (rating uint) (comment (string-ascii 500)) (is-anonymous bool))
+    (let
+        (
+            (feedback-id (var-get next-feedback-id))
+            (permission-check (unwrap-panic (check-feedback-permission grant-id tx-sender)))
+            (feedback-type (get feedback-type permission-check))
+        )
+        (asserts! (var-get feedback-enabled) ERR-NOT-AUTHORIZED)
+        (asserts! (get can-provide-feedback permission-check) ERR-FEEDBACK-ALREADY-EXISTS)
+        (asserts! (and (>= rating u1) (<= rating u5)) ERR-INVALID-RATING)
+        (asserts! (<= (len comment) u500) ERR-FEEDBACK-TOO-LONG)
+        
+        ;; Create the feedback entry
+        (map-set GrantFeedback feedback-id {
+            grant-id: grant-id,
+            feedback-type: feedback-type,
+            provider: tx-sender,
+            rating: rating,
+            comment: comment,
+            submitted-at: stacks-block-height,
+            is-anonymous: is-anonymous
+        })
+        
+        ;; Track that this provider has given feedback for this grant
+        (map-set FeedbackProviders {grant-id: grant-id, provider: tx-sender} feedback-id)
+        
+        ;; Update feedback summary
+        (unwrap-panic (update-feedback-summary grant-id rating feedback-type))
+        
+        (var-set next-feedback-id (+ feedback-id u1))
+        (ok feedback-id)
+    )
+)
+
+(define-public (toggle-feedback-system (enabled bool))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (var-set feedback-enabled enabled)
+        (ok true)
+    )
+)
+
+(define-public (get-grant-feedback-report (grant-id uint))
+    (let
+        (
+            (grant (unwrap! (get-grant grant-id) ERR-GRANT-NOT-FOUND))
+            (summary (default-to 
+                {total-feedback: u0, avg-rating: u0, recipient-feedback-count: u0, 
+                 committee-feedback-count: u0, public-feedback-count: u0}
+                (get-grant-feedback-summary grant-id)
+            ))
+        )
+        (ok {
+            grant-id: grant-id,
+            recipient: (get recipient grant),
+            total-feedback: (get total-feedback summary),
+            average-rating: (get avg-rating summary),
+            feedback-breakdown: {
+                recipient-feedback: (get recipient-feedback-count summary),
+                committee-feedback: (get committee-feedback-count summary),
+                public-feedback: (get public-feedback-count summary)
+            },
+            feedback-enabled: (var-get feedback-enabled)
+        })
+    )
+)
+
 (define-private (update-recipient-stats (recipient principal) (amount-change uint) (successful-milestones uint) (failed-milestones uint) (completion-time uint))
     (let
         (
@@ -461,6 +602,42 @@
             (current-value (get-platform-metric metric-name))
         )
         (map-set PlatformMetrics metric-name (+ current-value u1))
+    )
+)
+
+;; Grant Feedback System Private Functions
+(define-private (update-feedback-summary (grant-id uint) (rating uint) (feedback-type (string-ascii 20)))
+    (let
+        (
+            (current-summary (default-to 
+                {total-feedback: u0, avg-rating: u0, recipient-feedback-count: u0, 
+                 committee-feedback-count: u0, public-feedback-count: u0}
+                (get-grant-feedback-summary grant-id)
+            ))
+            (new-total (+ (get total-feedback current-summary) u1))
+            (old-avg-sum (* (get avg-rating current-summary) (get total-feedback current-summary)))
+            (new-avg-rating (/ (+ old-avg-sum rating) new-total))
+            (new-recipient-count (if (is-eq feedback-type "RECIPIENT")
+                (+ (get recipient-feedback-count current-summary) u1)
+                (get recipient-feedback-count current-summary)
+            ))
+            (new-committee-count (if (is-eq feedback-type "COMMITTEE")
+                (+ (get committee-feedback-count current-summary) u1)
+                (get committee-feedback-count current-summary)
+            ))
+            (new-public-count (if (is-eq feedback-type "PUBLIC")
+                (+ (get public-feedback-count current-summary) u1)
+                (get public-feedback-count current-summary)
+            ))
+        )
+        (map-set GrantFeedbackSummary grant-id {
+            total-feedback: new-total,
+            avg-rating: new-avg-rating,
+            recipient-feedback-count: new-recipient-count,
+            committee-feedback-count: new-committee-count,
+            public-feedback-count: new-public-count
+        })
+        (ok true)
     )
 )
 
