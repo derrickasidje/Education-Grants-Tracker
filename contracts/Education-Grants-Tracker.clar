@@ -14,6 +14,10 @@
 (define-constant ERR-FEEDBACK-ALREADY-EXISTS (err u113))
 (define-constant ERR-INVALID-RATING (err u114))
 (define-constant ERR-FEEDBACK-TOO-LONG (err u115))
+(define-constant ERR-APPEAL-NOT-FOUND (err u116))
+(define-constant ERR-APPEAL-ALREADY-EXISTS (err u117))
+(define-constant ERR-INVALID-APPEAL-STATUS (err u118))
+(define-constant ERR-APPEAL-WINDOW-CLOSED (err u119))
 
 (define-data-var contract-owner principal tx-sender)
 (define-data-var min-approval-threshold uint u3)
@@ -24,6 +28,9 @@
 (define-data-var auto-renewal-enabled bool true)
 (define-data-var next-feedback-id uint u1)
 (define-data-var feedback-enabled bool true)
+(define-data-var next-appeal-id uint u1)
+(define-data-var appeal-window-blocks uint u14400)
+(define-data-var appeal-enabled bool true)
 
 (define-map Grants 
     uint 
@@ -135,6 +142,25 @@
     uint
 )
 
+(define-map MilestoneAppeals
+    uint
+    {
+        milestone-id: uint,
+        appellant: principal,
+        reason: (string-ascii 500),
+        evidence: (string-ascii 1000),
+        appeal-status: (string-ascii 20),
+        appeal-date: uint,
+        reviewer-decision: (string-ascii 20),
+        review-date: uint
+    }
+)
+
+(define-map MilestoneAppealRegistry
+    uint
+    uint
+)
+
 (define-read-only (get-grant (grant-id uint))
     (map-get? Grants grant-id)
 )
@@ -174,6 +200,33 @@
 
 (define-read-only (get-grant-feedback-summary (grant-id uint))
     (map-get? GrantFeedbackSummary grant-id)
+)
+
+(define-read-only (get-milestone-appeal (appeal-id uint))
+    (map-get? MilestoneAppeals appeal-id)
+)
+
+(define-read-only (get-milestone-appeal-id (milestone-id uint))
+    (map-get? MilestoneAppealRegistry milestone-id)
+)
+
+(define-read-only (check-appeal-eligibility (milestone-id uint))
+    (let
+        (
+            (milestone (unwrap! (get-milestone milestone-id) ERR-MILESTONE-NOT-FOUND))
+            (blocks-since-due (- stacks-block-height (get due-date milestone)))
+            (appeal-window (var-get appeal-window-blocks))
+        )
+        (ok {
+            eligible: (and
+                (var-get appeal-enabled)
+                (<= blocks-since-due appeal-window)
+                (> (get rejection-count milestone) u0)
+            ),
+            blocks-since-due: blocks-since-due,
+            appeal-window-remaining: (if (> appeal-window blocks-since-due) (- appeal-window blocks-since-due) u0)
+        })
+    )
 )
 
 (define-read-only (check-feedback-permission (grant-id uint) (provider principal))
@@ -681,5 +734,76 @@
                    (+ (get successful-milestones stats) (get failed-milestones stats))) u0),
             avg-delivery-time: (get avg-completion-time stats)
         })
+    )
+)
+
+(define-public (submit-milestone-appeal (milestone-id uint) (reason (string-ascii 500)) (evidence (string-ascii 1000)))
+    (let
+        (
+            (appeal-id (var-get next-appeal-id))
+            (milestone (unwrap! (get-milestone milestone-id) ERR-MILESTONE-NOT-FOUND))
+            (grant (unwrap! (get-grant (get grant-id milestone)) ERR-GRANT-NOT-FOUND))
+            (eligibility (unwrap-panic (check-appeal-eligibility milestone-id)))
+            (existing-appeal (get-milestone-appeal-id milestone-id))
+        )
+        (asserts! (is-eq tx-sender (get recipient grant)) ERR-NOT-AUTHORIZED)
+        (asserts! (get eligible eligibility) ERR-APPEAL-WINDOW-CLOSED)
+        (asserts! (is-none existing-appeal) ERR-APPEAL-ALREADY-EXISTS)
+        (asserts! (> (len reason) u0) ERR-INVALID-AMOUNT)
+        
+        (map-set MilestoneAppeals appeal-id {
+            milestone-id: milestone-id,
+            appellant: tx-sender,
+            reason: reason,
+            evidence: evidence,
+            appeal-status: "PENDING",
+            appeal-date: stacks-block-height,
+            reviewer-decision: "",
+            review-date: u0
+        })
+        
+        (map-set MilestoneAppealRegistry milestone-id appeal-id)
+        (var-set next-appeal-id (+ appeal-id u1))
+        (ok appeal-id)
+    )
+)
+
+(define-public (review-milestone-appeal (appeal-id uint) (approved bool))
+    (let
+        (
+            (appeal (unwrap! (get-milestone-appeal appeal-id) ERR-APPEAL-NOT-FOUND))
+            (milestone (unwrap! (get-milestone (get milestone-id appeal)) ERR-MILESTONE-NOT-FOUND))
+            (decision (if approved "APPROVED" "REJECTED"))
+        )
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get appeal-status appeal) "PENDING") ERR-INVALID-APPEAL-STATUS)
+        
+        (map-set MilestoneAppeals appeal-id (merge appeal {
+            appeal-status: "REVIEWED",
+            reviewer-decision: decision,
+            review-date: stacks-block-height
+        }))
+        
+        (if approved
+            (begin
+                (map-set Milestones (get milestone-id appeal) (merge milestone {
+                    rejection-count: u0,
+                    approval-count: (var-get min-approval-threshold)
+                }))
+                (ok true)
+            )
+            (ok true)
+        )
+    )
+)
+
+(define-public (configure-appeal-settings (enabled bool) (window-blocks uint))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (asserts! (> window-blocks u0) ERR-INVALID-AMOUNT)
+        
+        (var-set appeal-enabled enabled)
+        (var-set appeal-window-blocks window-blocks)
+        (ok true)
     )
 )
